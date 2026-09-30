@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server/server.js",
     "init-db": "node -e \"require('./server/db').initDbFile()\"",
-    "test": "node scripts/test-cycle.js"
+    "test": "node scripts/test-cycle.js && node scripts/test-changesets.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",

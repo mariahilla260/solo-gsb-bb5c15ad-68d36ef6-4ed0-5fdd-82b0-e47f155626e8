@@ -24,6 +24,12 @@ function initDbFile() {
   return d;
 }
 
+// 当前业务版本（不存在则初始化为 0）
+function getRevision(d) {
+  const row = d.prepare("SELECT value FROM app_meta WHERE key = 'revision'").get();
+  return row ? parseInt(row.value, 10) || 0 : 0;
+}
+
 function initSchema(d) {
   d.exec(`
   CREATE TABLE IF NOT EXISTS materials (
@@ -92,7 +98,27 @@ function initSchema(d) {
   CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time, id);
   CREATE INDEX IF NOT EXISTS idx_process_inputs_event ON process_inputs(event_id);
   CREATE INDEX IF NOT EXISTS idx_releases_batch ON releases(batch_id);
+
+  -- 业务版本（单调递增）：任何影响推导/放行结果的正式写入都会 +1，
+  -- 用于让此前生成的“整组变更预演版本”过期。
+  CREATE TABLE IF NOT EXISTS app_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+
+  -- 整组变更预演版本（预演本身不改正式数据）
+  CREATE TABLE IF NOT EXISTS change_set_versions (
+    version_token TEXT PRIMARY KEY,
+    base_revision INTEGER NOT NULL,      -- 生成预演时的业务版本
+    payload_hash TEXT NOT NULL,          -- 规范化后变更内容的哈希（确认时必须一致）
+    payload_json TEXT NOT NULL,          -- 变更内容快照
+    result_summary_json TEXT NOT NULL DEFAULT '{}', -- 预演结果摘要（供查询/展示）
+    status TEXT NOT NULL DEFAULT 'ACTIVE'
+      CHECK (status IN ('ACTIVE','APPLIED','SUPERSEDED','EXPIRED')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    applied_at TEXT
+  );
   `);
 }
 
-module.exports = { getDb, initDbFile, DB_PATH };
+module.exports = { getDb, initDbFile, initSchema, getRevision, DB_PATH };

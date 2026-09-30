@@ -33,6 +33,111 @@
 - **同一设备同一时刻**存在多条事件（时间冲突）被拒绝。
 - 同一批次不能被两次加工产出。
 
+### 整组变更：预演 → 确认（业务版本乐观锁）
+
+车间调整加工顺序时，可在一次请求中提交：
+
+- `corrections`：对**多条既有加工或清洗事件**的更正（只传需要改的字段，未传字段保持原值）；
+- `insert_cleans`：**拟插入的清洗事件**（必须带时间与设备）。
+
+接口按**整组变更后的时间线**统一校验批次引用先后、引用环、设备时间冲突与批次唯一产出——
+因此“单条更正单独看暂时冲突、与同组其他更正合并后最终合法”的情形仍可预演。
+
+1. `POST /api/change-sets/preview`：在**内存影子库**上应用整组变更并全量校验/重算，
+   返回应用前后差异——
+   - `diff.batch_changes`：每个批次过敏原的前后集合（`added`/`removed`）；
+   - `diff.residue_changes`：每台设备残留及“最后已核实清洗时间”的前后差异；
+   - `diff.will_invalidate`：**将失效的放行记录**（附新增/移除过敏原与失效原因）；
+   - `before`/`after`：变更前后每批过敏原与设备残留完整快照；
+   - `timeline_after`：变更后整组时间线（`corrected`/`inserted` 标记）。
+
+   预演**不改动**正式事件、推导结果与放行状态，响应携带业务版本号 `revision`
+   与一次性预演版本 `version_token`。
+2. `POST /api/change-sets/apply`：确认应用，**必须**携带同一 `version_token`
+   及与预演**完全相同**的 `corrections` / `insert_cleans`。服务端在**一次事务**中
+   重新校验并整体落库，返回实际失效的放行记录与新业务版本。
+
+业务版本（revision，单调递增，也在 `GET /api/state` 中返回）规则：
+
+- 任何**影响推导/放行结果的正式写入**（新增/更正/删除事件、原料过敏原修改、
+  设备更名、放行登记/删除、整组应用）都会在其事务内推进 revision；
+- 预演**不**推进 revision；预演后一旦发生上述正式写入，此前所有预演版本立即过期，
+  确认返回 `409 REVISION_STALE` 并保持原状态不变，需重新预演；
+- 同一预演版本只能应用一次（重复应用返回 `409 VERSION_APPLIED`）；
+- 确认内容与预演不一致返回 `400 PAYLOAD_MISMATCH`；未知版本返回 `404 VERSION_UNKNOWN`。
+
+明确拒绝的非法输入（HTTP 400，`details` 给出逐条原因）：未知事件、重复更正同一事件、
+设备不存在、插入的清洗事件缺少时间；整组时间线不合法时返回 `validation_errors`
+（引用未来批次/引用环/设备时间冲突/批次唯一产出），预演失败不落任何版本。
+
+#### 调用示例（curl）
+
+预演：把 09:00 的已核实清洗提前到 07:30，并在 FRYER-B 的 12:30 插入一次清洗：
+
+```bash
+curl -s -X POST http://localhost:3000/api/change-sets/preview \
+  -H 'Content-Type: application/json' -d '{
+    "corrections": [
+      { "event_id": 2, "event_time": "2026-09-30T07:30" },
+      { "event_id": 4, "note": "整组更正：备注调整，字段未传则保持原值" }
+    ],
+    "insert_cleans": [
+      { "event_time": "2026-09-30T12:30", "equipment_id": 2,
+        "note": "换线前已核实清洗", "client_ref": "clean-12-30" }
+    ]
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "version_token": "35a45a23…", "revision": 3, "valid": true,
+  "counts": { "corrections": 2, "insert_cleans": 1,
+              "batch_changes": 2, "residue_changes": 1, "will_invalidate": 1 },
+  "diff": {
+    "batch_changes": [
+      { "batch_code": "BATCH-002", "added": ["含麸质的谷物"], "removed": [], "...": "…" }
+    ],
+    "residue_changes": [
+      { "equipment_code": "FRYER-B",
+        "before_last_cleaned_at": "2026-09-30T13:00",
+        "after_last_cleaned_at": "2026-09-30T16:00" }
+    ],
+    "will_invalidate": [
+      { "batch_code": "BATCH-003", "added": ["含麸质的谷物"],
+        "reason": "预演重算后过敏原集合与放行登记时不同（新增：含麸质的谷物）" }
+    ]
+  },
+  "inserted_cleans": [
+    { "client_ref": "clean-12-30", "event_time": "2026-09-30T12:30",
+      "equipment_code": "FRYER-B", "equipment_id": 2 }
+  ]
+}
+```
+
+确认（内容与预演逐字段一致）：
+
+```bash
+curl -s -X POST http://localhost:3000/api/change-sets/apply \
+  -H 'Content-Type: application/json' -d '{
+    "version_token": "35a45a23…",
+    "corrections": [
+      { "event_id": 2, "event_time": "2026-09-30T07:30" },
+      { "event_id": 4, "note": "整组更正：备注调整，字段未传则保持原值" }
+    ],
+    "insert_cleans": [
+      { "event_time": "2026-09-30T12:30", "equipment_id": 2,
+        "note": "换线前已核实清洗", "client_ref": "clean-12-30" }
+    ]
+  }'
+```
+
+字段说明：加工事件的更正可选 `event_time` / `equipment_id` / `note` / `batch_code` /
+`material_ids`（**全量替换**原料列表）/ `ref_batch_ids`（全量替换引用批次列表）；
+清洗事件的更正只能改 `event_time` / `equipment_id` / `note`。`client_ref` 是调用方
+给拟插入清洗起的可选引用号，确认响应会带回其正式 `event_id`（不传时按提交顺序编号）。
+
 ## 一键启动（Docker，从空环境开始）
 
 要求安装 Docker 与 Docker Compose（v2）。在项目目录执行：
@@ -104,12 +209,22 @@ npm start                      # 自动创建 data/allergen.db、建表并写入
 
 ```
 server/
-  db.js          # SQLite 连接与表结构
+  db.js          # SQLite 连接、表结构与业务版本（revision）
   validation.js  # 全量校验（未来批次/循环/时间冲突/重复产出）
   recompute.js   # 推导引擎：回放事件、批次并集、设备残留、放行核对
+  changesets.js  # 整组变更：解析/规范化哈希、内存影子库、前后快照差异
   seed.js        # 首次启动演示数据
-  server.js      # Express API 与静态页面
+  server.js      # Express API 与静态页面（含 /api/change-sets 预演/确认）
 public/
   index.html  styles.css  app.js
+scripts/
+  test-cycle.js       # 引用链/引用环校验单测
+  test-changesets.js  # 整组变更预演/确认 HTTP API 端到端测试
 Dockerfile  docker-compose.yml
+```
+
+## 自动化测试
+
+```bash
+npm test   # 先跑引用校验单测，再起临时服务跑整组变更 API 的端到端测试
 ```
