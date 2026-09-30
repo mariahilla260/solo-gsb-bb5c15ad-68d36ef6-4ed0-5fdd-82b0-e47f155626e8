@@ -5,6 +5,7 @@ const { getDb } = require('./db');
 const { validateAll } = require('./validation');
 const { recompute, sortedJson } = require('./recompute');
 const { seedIfEmpty } = require('./seed');
+const replan = require('./replan');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -368,6 +369,36 @@ app.delete('/api/releases/:id', (req, res) => {
   if (!info.changes) return res.status(404).json({ error: '放行记录不存在' });
   res.json({ ok: true });
 });
+
+// ---------- 换线整组预演 / 确认应用 ----------
+// 预演：在内存影子库上应用整组变更并全量重算，只返回差异与业务版本，不写正式数据。
+app.post('/api/replan/preview', (req, res) => {
+  try {
+    res.json(replan.preview(db, (req.body || {}).changes));
+  } catch (err) { sendReplanError(res, err); }
+});
+
+// 确认应用：必须携带预演版本与完全相同的 changes，一次事务内重新校验、重算并落库。
+app.post('/api/replan/apply', (req, res) => {
+  try {
+    res.json(replan.apply(db, req.body || {}));
+  } catch (err) { sendReplanError(res, err); }
+});
+
+function sendReplanError(res, err) {
+  if (err && err.name === 'ReplanError') {
+    // 预演版本过期/签名失效/内容不一致：冲突类语义，明确拒绝且不改动任何数据。
+    const status = err.code === 'VERSION_EXPIRED' || err.code === 'CHANGES_MISMATCH'
+      ? 409 : 400;
+    return res.status(status).json({
+      error: err.message,
+      code: err.code,
+      details: err.details
+    });
+  }
+  console.error(err);
+  return res.status(500).json({ error: err && err.message ? err.message : '服务器内部错误' });
+}
 
 // 兼容前端对未知路由回退到首页
 app.get(/^(?!\/api\/).*/, (req, res, next) => {

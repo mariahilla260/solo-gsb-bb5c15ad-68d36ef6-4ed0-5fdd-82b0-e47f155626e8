@@ -95,4 +95,4 @@ function initSchema(d) {
   `);
 }
 
-module.exports = { getDb, initDbFile, DB_PATH };
+module.exports = { getDb, initDbFile, initSchema, DB_PATH };
